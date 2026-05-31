@@ -57,54 +57,23 @@ def build_daily_df(transactions: List[Transaction], tx_type: str) -> pd.DataFram
     return df.sort_values("ds").reset_index(drop=True)
 
 
-def forecast_series(df: pd.DataFrame, horizon: int):
-    today = datetime.today()
-    dates = [today + timedelta(days=i+1) for i in range(horizon)]
-
-    if df.empty or len(df) < 2:
-        return pd.DataFrame({
-            "ds": dates,
-            "yhat": [0.0] * horizon,
-            "yhat_lower": [0.0] * horizon,
-            "yhat_upper": [0.0] * horizon,
-        })
+def get_avg_daily(df: pd.DataFrame) -> tuple:
+    """
+    Return (avg, std) per hari dari data historis.
+    Pakai rata-rata sederhana — lebih stabil untuk data sedikit.
+    """
+    if df.empty:
+        return 0.0, 0.0
 
     # Isi gap tanggal dengan 0
     full_range = pd.date_range(df["ds"].min(), df["ds"].max(), freq="D")
     df_filled = df.set_index("ds").reindex(full_range, fill_value=0).reset_index()
     df_filled.columns = ["ds", "y"]
 
-    mean_val = float(df_filled["y"].mean())
-    std_val  = float(df_filled["y"].std(ddof=0)) if len(df_filled) > 1 else mean_val * 0.1
+    avg = float(df_filled["y"].mean())
+    std = float(df_filled["y"].std(ddof=0)) if len(df_filled) > 1 else avg * 0.15
 
-    # Hitung trend sederhana pakai linear regression
-    x = np.arange(len(df_filled))
-    y = df_filled["y"].values
-    if len(x) >= 2:
-        coeffs = np.polyfit(x, y, 1)
-        slope, intercept = coeffs[0], coeffs[1]
-    else:
-        slope, intercept = 0, mean_val
-
-    last_x = len(df_filled)
-    yhats, lowers, uppers = [], [], []
-
-    for i in range(horizon):
-        xi    = last_x + i
-        yhat  = max(0, slope * xi + intercept)
-        # Interval 80% menggunakan std dari historical
-        lower = max(0, yhat - 1.28 * std_val)
-        upper = yhat + 1.28 * std_val
-        yhats.append(round(yhat, 2))
-        lowers.append(round(lower, 2))
-        uppers.append(round(upper, 2))
-
-    return pd.DataFrame({
-        "ds":         dates,
-        "yhat":       yhats,
-        "yhat_lower": lowers,
-        "yhat_upper": uppers,
-    })
+    return avg, std
 
 
 @app.get("/")
@@ -125,61 +94,74 @@ def predict(req: PredictRequest):
     income_df  = build_daily_df(req.transactions, "INCOME")
     expense_df = build_daily_df(req.transactions, "EXPENSE")
 
-    income_fc  = forecast_series(income_df,  horizon)
-    expense_fc = forecast_series(expense_df, horizon)
+    # Hitung rata-rata & std harian dari historical data
+    avg_income,  std_income  = get_avg_daily(income_df)
+    avg_expense, std_expense = get_avg_daily(expense_df)
 
+    # Hitung current balance dari semua transaksi historis
+    total_historical_income  = sum(t.amount for t in req.transactions if t.type == "INCOME")
+    total_historical_expense = sum(t.amount for t in req.transactions if t.type == "EXPENSE")
+    current_balance = total_historical_income - total_historical_expense
+
+    today = datetime.today()
     details = []
-    running_balance       = 0.0
-    running_balance_upper = 0.0
-    running_balance_lower = 0.0
-    total_income  = 0.0
-    total_expense = 0.0
 
-    n = min(len(income_fc), len(expense_fc), horizon)
+    running_balance       = current_balance
+    running_balance_upper = current_balance
+    running_balance_lower = current_balance
 
-    for i in range(n):
-        inc_val   = float(income_fc.iloc[i]["yhat"])
-        inc_upper = float(income_fc.iloc[i]["yhat_upper"])
-        inc_lower = float(income_fc.iloc[i]["yhat_lower"])
-        exp_val   = float(expense_fc.iloc[i]["yhat"])
-        exp_upper = float(expense_fc.iloc[i]["yhat_upper"])
-        exp_lower = float(expense_fc.iloc[i]["yhat_lower"])
+    total_projected_income  = 0.0
+    total_projected_expense = 0.0
 
-        running_balance       += inc_val   - exp_val
-        running_balance_upper += inc_upper - exp_lower
-        running_balance_lower += inc_lower - exp_upper
+    for i in range(horizon):
+        date_str = (today + timedelta(days=i+1)).strftime("%Y-%m-%d")
 
-        total_income  += inc_val
-        total_expense += exp_val
+        # Prediksi harian = rata-rata historis (realistic)
+        daily_income  = max(0.0, avg_income)
+        daily_expense = max(0.0, avg_expense)
 
-        date_str = income_fc.iloc[i]["ds"].strftime("%Y-%m-%d")
+        # Skenario optimistic: income lebih tinggi, expense lebih rendah
+        daily_income_upper  = max(0.0, avg_income  + 1.28 * std_income)
+        daily_expense_lower = max(0.0, avg_expense - 1.28 * std_expense)
+
+        # Skenario pessimistic: income lebih rendah, expense lebih tinggi
+        daily_income_lower  = max(0.0, avg_income  - 1.28 * std_income)
+        daily_expense_upper = max(0.0, avg_expense + 1.28 * std_expense)
+
+        running_balance       += daily_income  - daily_expense
+        running_balance_upper += daily_income_upper  - daily_expense_lower
+        running_balance_lower += daily_income_lower  - daily_expense_upper
+
+        total_projected_income  += daily_income
+        total_projected_expense += daily_expense
 
         details.append(DailyForecast(
             forecast_date     = date_str,
-            predicted_income  = round(inc_val,   2),
-            predicted_expense = round(exp_val,   2),
+            predicted_income  = round(daily_income,   2),
+            predicted_expense = round(daily_expense,  2),
             predicted_balance = round(running_balance, 2),
             balance_upper     = round(running_balance_upper, 2),
             balance_lower     = round(running_balance_lower, 2),
         ))
 
-    net = total_income - total_expense
+    net = total_projected_income - total_projected_expense
 
     return PredictResponse(
         success                 = True,
         horizon                 = horizon,
-        total_projected_income  = round(total_income,  2),
-        total_projected_expense = round(total_expense, 2),
+        total_projected_income  = round(total_projected_income,  2),
+        total_projected_expense = round(total_projected_expense, 2),
         net_cashflow            = round(net, 2),
-        net_cashflow_upper      = round(running_balance_upper, 2),
-        net_cashflow_lower      = round(running_balance_lower, 2),
+        net_cashflow_upper      = round(running_balance_upper - current_balance, 2),
+        net_cashflow_lower      = round(running_balance_lower - current_balance, 2),
         forecast_details        = details,
         model_info              = {
-            "model":        "Linear Trend + Std Interval",
-            "data_points":  len(req.transactions),
-            "income_days":  len(income_df),
-            "expense_days": len(expense_df),
-            "horizon_days": horizon,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "model":            "Daily Average + Std Interval",
+            "current_balance":  round(current_balance, 2),
+            "avg_daily_income": round(avg_income,  2),
+            "avg_daily_expense":round(avg_expense, 2),
+            "data_points":      len(req.transactions),
+            "horizon_days":     horizon,
+            "generated_at":     datetime.utcnow().isoformat() + "Z",
         },
     )
